@@ -1,0 +1,90 @@
+WITH
+-- 1. Cộng dồn lỗi theo từng time_frame
+aggregated_errors AS (
+SELECT
+time_frames,
+sumMerge(total_errors) AS total_errors
+FROM
+stage_core.tbl_dis__agg__log_errors
+GROUP BY
+time_frames
+ORDER BY
+time_frames
+),
+
+-- 2. Tính trung bình trượt trong 4 giờ gần nhất của ngày hiện tại và 2-3 ngày trước
+trend_calc AS (
+SELECT
+a.time_frames,
+a.total_errors,
+avg(b.total_errors) AS moving_avg_trend
+FROM
+aggregated_errors a,
+aggregated_errors b
+WHERE
+(b.time_frames BETWEEN (a.time_frames - INTERVAL 2 HOUR) AND a.time_frames) -- 4 giờ gần nhất hôm nay
+OR (b.time_frames BETWEEN (a.time_frames - INTERVAL 1 DAY - INTERVAL 2 HOUR) AND (a.time_frames - INTERVAL 1 DAY + INTERVAL 2 HOUR)) -- 4 giờ 1 ngày trước
+OR (b.time_frames BETWEEN (a.time_frames - INTERVAL 2 DAY - INTERVAL 2 HOUR) AND (a.time_frames - INTERVAL 2 DAY + INTERVAL 2 HOUR)) -- 4 giờ 2 ngày trước
+OR (b.time_frames BETWEEN (a.time_frames - INTERVAL 3 DAY - INTERVAL 2 HOUR) AND (a.time_frames - INTERVAL 3 DAY + INTERVAL 2 HOUR)) -- 4 giờ 3 ngày trước
+OR (b.time_frames BETWEEN (a.time_frames - INTERVAL 4 DAY - INTERVAL 2 HOUR) AND (a.time_frames - INTERVAL 4 DAY + INTERVAL 2 HOUR)) -- 4 giờ 4 ngày trước
+OR (b.time_frames BETWEEN (a.time_frames - INTERVAL 5 DAY - INTERVAL 2 HOUR) AND (a.time_frames - INTERVAL 5 DAY + INTERVAL 2 HOUR)) -- 4 giờ 5 ngày trước
+OR (b.time_frames BETWEEN (a.time_frames - INTERVAL 6 DAY - INTERVAL 2 HOUR) AND (a.time_frames - INTERVAL 6 DAY + INTERVAL 2 HOUR)) -- 4 giờ 6 ngày trước
+GROUP BY
+a.time_frames, a.total_errors
+),
+
+-- 3. Tính residual = Total Errors - Moving Average Trend
+residual_calc AS (
+SELECT
+time_frames,
+total_errors,
+moving_avg_trend,
+total_errors - moving_avg_trend AS residual
+FROM
+trend_calc
+),
+
+-- 4. Tính IQR từ Residual (trong cùng tệp mẫu như trend_calc)
+iqr_calc AS (
+SELECT
+a.time_frames,
+a.total_errors,
+a.moving_avg_trend,
+a.residual,
+quantile(0.25)(b.residual) AS Q1, -- Q1 trong 4 giờ gần nhất và 3 ngày trước
+quantile(0.75)(b.residual) AS Q3, -- Q3 trong 4 giờ gần nhất và 3 ngày trước
+(quantile(0.75)(b.residual) - quantile(0.25)(b.residual)) AS IQR -- IQR
+FROM
+residual_calc a,
+residual_calc b
+WHERE
+(b.time_frames BETWEEN (a.time_frames - INTERVAL 2 HOUR) AND a.time_frames) -- 4 giờ gần nhất hôm nay
+OR (b.time_frames BETWEEN (a.time_frames - INTERVAL 1 DAY - INTERVAL 2 HOUR) AND (a.time_frames - INTERVAL 1 DAY + INTERVAL 2 HOUR)) -- 4 giờ hôm qua
+OR (b.time_frames BETWEEN (a.time_frames - INTERVAL 2 DAY - INTERVAL 2 HOUR) AND (a.time_frames - INTERVAL 2 DAY + INTERVAL 2 HOUR)) -- 4 giờ ngày hôm kia
+OR (b.time_frames BETWEEN (a.time_frames - INTERVAL 3 DAY - INTERVAL 2 HOUR) AND (a.time_frames - INTERVAL 3 DAY + INTERVAL 2 HOUR)) -- 4 giờ ngày hôm trước
+GROUP BY
+a.time_frames, a.total_errors, a.residual, a.moving_avg_trend
+),
+
+-- 5. Xác định Outliers
+outlier_detection AS (
+SELECT
+time_frames,
+total_errors,
+moving_avg_trend,
+residual,
+Q1,
+Q3,
+IQR,
+CASE
+WHEN residual < Q1 - 1.5 * IQR THEN 'low_outlier'
+WHEN residual > Q3 + 1.5 * IQR THEN 'high_outlier'
+ELSE 'normal'
+END AS outlier_status
+FROM
+iqr_calc
+)
+
+SELECT *
+FROM outlier_detection
+ORDER BY time_frames DESC;
